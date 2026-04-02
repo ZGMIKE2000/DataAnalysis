@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from data_loader import (
     discover_data_dirs,
     load_round_data,
@@ -225,7 +226,8 @@ def compute_trades_height(current_trades: pd.DataFrame) -> int:
 # ---------------------------------------------------------------------------
 DATA_ROOT = st.sidebar.text_input(
     "Data root directory",
-    value="/Users/zhilialexanderli/Python_projects",
+    # Default to the `data` directory next to this script so the repo is portable
+    value=str(Path(__file__).parent / "data"),
     help="Root folder to scan for Prosperity CSV data",
 )
 

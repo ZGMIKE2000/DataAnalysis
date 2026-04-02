@@ -286,6 +286,36 @@ def get_trades_in_step_range(
     return trades.loc[mask].copy()
 
 
+def compute_imbalance(price_ctx: pd.DataFrame) -> pd.DataFrame:
+    """Compute order book imbalance for a price context DataFrame.
+
+    Adds two columns to a *copy* of the input:
+      - imbalance_l1 : (bid_vol_1 - ask_vol_1) / (bid_vol_1 + ask_vol_1)
+      - imbalance_l3 : (sum bid_vol_1..3 - sum ask_vol_1..3) / (sum bid_vol_1..3 + sum ask_vol_1..3)
+
+    Values range from -1 (pure ask pressure) to +1 (pure bid pressure).
+    Returns the augmented DataFrame (does not mutate the original).
+    """
+    df = price_ctx.copy()
+
+    # --- Level 1 ---
+    bv1 = df.get("bid_volume_1", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    av1 = df.get("ask_volume_1", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    total_l1 = bv1 + av1
+    df["imbalance_l1"] = np.where(total_l1 > 0, (bv1 - av1) / total_l1, 0.0)
+
+    # --- Level 3 (aggregate) ---
+    bid_sum = pd.Series(0.0, index=df.index)
+    ask_sum = pd.Series(0.0, index=df.index)
+    for i in range(1, 4):
+        bid_sum += df.get(f"bid_volume_{i}", pd.Series(0, index=df.index)).fillna(0).astype(float)
+        ask_sum += df.get(f"ask_volume_{i}", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    total_l3 = bid_sum + ask_sum
+    df["imbalance_l3"] = np.where(total_l3 > 0, (bid_sum - ask_sum) / total_l3, 0.0)
+
+    return df
+
+
 def format_step_label(day, timestamp) -> str:
     """Format a single step as a readable label."""
     if day is not None and timestamp is not None:

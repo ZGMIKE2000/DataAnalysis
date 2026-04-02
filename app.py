@@ -21,6 +21,7 @@ from data_loader import (
     get_price_context_by_step,
     get_trades_in_step_range,
     format_step_label,
+    compute_imbalance,
 )
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,21 @@ context_window = st.sidebar.slider(
     "Price context window (steps)", 10, 200, 50, step=10
 )
 
+# Order book imbalance controls
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Order Book Imbalance**")
+imbalance_level = st.sidebar.radio(
+    "Depth level",
+    ("Level 1 (BBO)", "Level 3 (Full book)"),
+    index=0,
+    help="Level 1 uses best bid/ask only.  Level 3 aggregates all three levels.",
+)
+imbalance_col = "imbalance_l1" if "Level 1" in imbalance_level else "imbalance_l3"
+imbalance_threshold = st.sidebar.slider(
+    "Extreme zone threshold", 0.3, 0.95, 0.6, step=0.05,
+    help="Highlight regions where |imbalance| exceeds this value.",
+)
+
 st.sidebar.markdown("---")
 st.sidebar.caption(f"**{selected_dir['label']}**")
 st.sidebar.caption(f"{len(instruments)} instruments  ·  {total_steps} timestamps")
@@ -339,7 +355,26 @@ else:
 # ---------------------------------------------------------------------------
 # Metrics row
 # ---------------------------------------------------------------------------
-mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+
+# Compute imbalance at current step
+def _current_imbalance(ob: dict, level: str) -> float | None:
+    """Compute imbalance from the current order book snapshot."""
+    bids = ob["bids"]  # [(price, vol), ...]
+    asks = ob["asks"]
+    if not bids and not asks:
+        return None
+    if level == "imbalance_l1":
+        bv = bids[0][1] if bids else 0
+        av = asks[0][1] if asks else 0
+    else:
+        bv = sum(v for _, v in bids)
+        av = sum(v for _, v in asks)
+    total = bv + av
+    return (bv - av) / total if total > 0 else 0.0
+
+_cur_imb = _current_imbalance(ob, imbalance_col)
+
+mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
 mcol1.metric("Mid Price", f"{ob['mid_price']:.2f}" if ob["mid_price"] else "—")
 
 if ob["bids"] and ob["asks"]:
@@ -353,6 +388,12 @@ else:
     mcol2.metric("Spread", "—")
     mcol3.metric("Best Bid", "—")
     mcol4.metric("Best Ask", "—")
+
+if _cur_imb is not None:
+    _imb_label = "Imbalance L1" if imbalance_col == "imbalance_l1" else "Imbalance L3"
+    mcol5.metric(_imb_label, f"{_cur_imb:+.3f}")
+else:
+    mcol5.metric("Imbalance", "—")
 
 # ---------------------------------------------------------------------------
 # Layout: Order book + Trades  |  Price chart
@@ -378,14 +419,19 @@ with right_col:
     st.subheader("Price Context")
 
     if not price_ctx.empty:
+        # Compute imbalance for the visible window
+        price_ctx_imb = compute_imbalance(price_ctx)
+        imb_vals = price_ctx_imb[imbalance_col].values
+
         fig = make_subplots(
-            rows=2, cols=1,
+            rows=3, cols=1,
             shared_xaxes=True,
-            row_heights=[0.75, 0.25],
-            vertical_spacing=0.05,
+            row_heights=[0.55, 0.20, 0.25],
+            vertical_spacing=0.04,
+            subplot_titles=(None, None, None),
         )
 
-        ctx_steps = price_ctx["step_idx"].values
+        ctx_steps = price_ctx_imb["step_idx"].values
 
         n_ticks = min(12, len(ctx_steps))
         tick_positions = np.linspace(0, len(ctx_steps) - 1, n_ticks, dtype=int)
@@ -397,10 +443,11 @@ with right_col:
             if ctx_steps[0] <= b["step_idx"] <= ctx_steps[-1]
         ]
 
+        # ----- Row 1: Price chart -----
         # Mid price
         fig.add_trace(
             go.Scatter(
-                x=ctx_steps, y=price_ctx["mid_price"].values,
+                x=ctx_steps, y=price_ctx_imb["mid_price"].values,
                 mode="lines", name="Mid Price",
                 line=dict(color="#5C9DFF", width=2),
                 hovertemplate="%{y:.2f}<extra>Mid</extra>",
@@ -409,10 +456,10 @@ with right_col:
         )
 
         # Bid/Ask bands
-        if "bid_price_1" in price_ctx.columns and "ask_price_1" in price_ctx.columns:
+        if "bid_price_1" in price_ctx_imb.columns and "ask_price_1" in price_ctx_imb.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=ctx_steps, y=price_ctx["bid_price_1"].values,
+                    x=ctx_steps, y=price_ctx_imb["bid_price_1"].values,
                     mode="lines", name="Best Bid",
                     line=dict(color="rgba(38,166,91,0.5)", width=1),
                     hovertemplate="%{y:.2f}<extra>Bid</extra>",
@@ -421,7 +468,7 @@ with right_col:
             )
             fig.add_trace(
                 go.Scatter(
-                    x=ctx_steps, y=price_ctx["ask_price_1"].values,
+                    x=ctx_steps, y=price_ctx_imb["ask_price_1"].values,
                     mode="lines", name="Best Ask",
                     line=dict(color="rgba(239,83,80,0.5)", width=1),
                     fill="tonexty", fillcolor="rgba(200,200,200,0.08)",
@@ -461,7 +508,36 @@ with right_col:
                 row=1, col=1,
             )
 
-        # Day boundaries
+        # Extreme imbalance zones — highlight on the price subplot
+        # Walk through imbalance values and find contiguous runs above the threshold
+        _in_zone = False
+        _zone_start = None
+        _zone_sign = 0
+        for k, (sx, iv) in enumerate(zip(ctx_steps, imb_vals)):
+            if abs(iv) >= imbalance_threshold:
+                if not _in_zone:
+                    _in_zone = True
+                    _zone_start = sx
+                    _zone_sign = 1 if iv > 0 else -1
+            else:
+                if _in_zone:
+                    _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
+                    fig.add_vrect(
+                        x0=_zone_start, x1=ctx_steps[k - 1],
+                        fillcolor=_color, line_width=0,
+                        layer="below", row=1, col=1,
+                    )
+                    _in_zone = False
+        # Close trailing zone
+        if _in_zone:
+            _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
+            fig.add_vrect(
+                x0=_zone_start, x1=ctx_steps[-1],
+                fillcolor=_color, line_width=0,
+                layer="below", row=1, col=1,
+            )
+
+        # Day boundaries (all rows)
         for b in day_boundary_steps:
             fig.add_vline(x=b["step_idx"], line_dash="dot",
                           line_color="rgba(255,215,0,0.4)", line_width=1)
@@ -472,33 +548,61 @@ with right_col:
                 yanchor="bottom", xanchor="left", xshift=4,
             )
 
-        # Volume subplot
-        if "bid_volume_1" in price_ctx.columns:
-            bid_vol_cols = [c for c in price_ctx.columns if c.startswith("bid_volume")]
-            ask_vol_cols = [c for c in price_ctx.columns if c.startswith("ask_volume")]
+        # ----- Row 2: Imbalance subplot -----
+        # Color each bar green (bid pressure) or red (ask pressure)
+        imb_colors = np.where(
+            imb_vals >= 0,
+            "rgba(34,197,94,0.7)",   # green for bid-heavy
+            "rgba(239,68,68,0.7)",   # red for ask-heavy
+        )
+        fig.add_trace(
+            go.Bar(
+                x=ctx_steps, y=imb_vals,
+                name="Imbalance",
+                marker_color=imb_colors.tolist(),
+                hovertemplate="%{y:+.3f}<extra>Imbalance</extra>",
+            ),
+            row=2, col=1,
+        )
+        # Threshold reference lines
+        fig.add_hline(y=imbalance_threshold, line_dash="dot",
+                      line_color="rgba(34,197,94,0.4)", line_width=1, row=2, col=1)
+        fig.add_hline(y=-imbalance_threshold, line_dash="dot",
+                      line_color="rgba(239,68,68,0.4)", line_width=1, row=2, col=1)
+        fig.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_width=0.5, row=2, col=1)
+
+        # ----- Row 3: Volume subplot -----
+        if "bid_volume_1" in price_ctx_imb.columns:
+            bid_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("bid_volume")]
+            ask_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("ask_volume")]
             fig.add_trace(
-                go.Bar(x=ctx_steps, y=price_ctx[bid_vol_cols].sum(axis=1).values,
+                go.Bar(x=ctx_steps, y=price_ctx_imb[bid_vol_cols].sum(axis=1).values,
                        name="Bid Vol", marker_color="rgba(38,166,91,0.5)"),
-                row=2, col=1,
+                row=3, col=1,
             )
             fig.add_trace(
-                go.Bar(x=ctx_steps, y=price_ctx[ask_vol_cols].sum(axis=1).values,
+                go.Bar(x=ctx_steps, y=price_ctx_imb[ask_vol_cols].sum(axis=1).values,
                        name="Ask Vol", marker_color="rgba(239,83,80,0.5)"),
-                row=2, col=1,
+                row=3, col=1,
             )
 
         fig.update_layout(
-            height=550,
+            height=700,
             margin=dict(l=0, r=0, t=10, b=0),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
             barmode="group", hovermode="x unified",
         )
+        # X-axis tick labels only on the bottom subplot
         fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
-                         tickangle=-30, row=2, col=1)
+                         tickangle=-30, row=3, col=1)
         fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
                          showticklabels=False, row=1, col=1)
+        fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
+                         showticklabels=False, row=2, col=1)
         fig.update_yaxes(title_text="Price", row=1, col=1)
-        fig.update_yaxes(title_text="Book Vol", row=2, col=1)
+        _imb_axis_label = "Imb L1" if imbalance_col == "imbalance_l1" else "Imb L3"
+        fig.update_yaxes(title_text=_imb_axis_label, range=[-1.05, 1.05], row=2, col=1)
+        fig.update_yaxes(title_text="Book Vol", row=3, col=1)
 
         st.plotly_chart(fig, use_container_width=True, key="price_chart")
     else:

@@ -27,13 +27,22 @@ def discover_data_dirs(root: str) -> list[dict]:
             continue
         round_num = int(m.group(1))
 
-        path_str = str(folder)
-        if "Prosperity 4" in path_str or "prosperity4" in path_str:
+        # Detect season from the closest path component, not the full path
+        # (avoids false matches when the repo itself sits inside "Prosperity 4/")
+        parts = [p.lower() for p in folder.parts]
+        if "prosperity4" in parts:
             season = 4
-        elif "Prosperity 3" in path_str or "prosperity3" in path_str:
+        elif "prosperity3" in parts:
             season = 3
         else:
-            season = 0
+            # Fallback: check folder name fragments
+            folder_lower = folder.name.lower()
+            if "prosperity4" in folder_lower or "prosperity 4" in folder_lower:
+                season = 4
+            elif "prosperity3" in folder_lower or "prosperity 3" in folder_lower:
+                season = 3
+            else:
+                season = 0
 
         label = f"S{season} Round {round_num} — {folder.name}"
         results.append({

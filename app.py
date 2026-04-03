@@ -22,6 +22,7 @@ from data_loader import (
     get_trades_in_step_range,
     format_step_label,
     compute_imbalance,
+    build_ofi_series,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,8 +36,12 @@ st.set_page_config(
 
 st.markdown(
     """<style>
-    .block-container {padding-top: 1rem; padding-bottom: 0rem;}
+    .block-container {padding-top: 2.5rem; padding-bottom: 0rem;}
     div[data-testid="stMetric"] {background: #1e1e2f; border-radius: 8px; padding: 12px 16px;}
+    /* Hide the default Streamlit colored header bar / toolbar decoration */
+    header[data-testid="stHeader"] {background: transparent !important;}
+    div[data-testid="stDecoration"] {display: none !important;}
+    div[data-testid="stToolbar"] {display: none !important;}
     </style>""",
     unsafe_allow_html=True,
 )
@@ -282,9 +287,14 @@ if idx is None:
 
 total_steps = len(idx["step_idxs"])
 
-# Context window slider
+# Context window slider — max = total_steps so user can view the full series
 context_window = st.sidebar.slider(
-    "Price context window (steps)", 10, 200, 50, step=10
+    "Price context window (steps)",
+    min_value=10,
+    max_value=max(10, total_steps),
+    value=min(50, total_steps),
+    step=10,
+    help="Number of steps shown each side of the cursor. Set to max for the full series.",
 )
 
 # Order book imbalance controls
@@ -301,6 +311,25 @@ imbalance_threshold = st.sidebar.slider(
     "Extreme zone threshold", 0.3, 0.95, 0.6, step=0.05,
     help="Highlight regions where |imbalance| exceeds this value.",
 )
+
+# Order Flow Imbalance (OFI) controls
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Order Flow Imbalance (OFI)**")
+OFI_WINDOWS = (5, 10, 20)
+ofi_window = st.sidebar.select_slider(
+    "Rolling window (steps)",
+    options=list(OFI_WINDOWS),
+    value=10,
+    help="Number of steps over which to sum net signed trade volume.",
+)
+ofi_col = f"ofi_{ofi_window}"
+
+# Pre-compute OFI for the entire instrument (cached for scrubbing speed)
+@st.cache_data(show_spinner=False)
+def cached_ofi(_trades, _prices, instrument, _idx, _folder_path):
+    return build_ofi_series(_trades, _prices, instrument, _idx, windows=OFI_WINDOWS)
+
+ofi_series = cached_ofi(trades, prices, selected_instrument, idx, selected_dir["path"])
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"**{selected_dir['label']}**")
@@ -374,7 +403,11 @@ def _current_imbalance(ob: dict, level: str) -> float | None:
 
 _cur_imb = _current_imbalance(ob, imbalance_col)
 
-mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+# Current OFI value at this step
+_cur_ofi_row = ofi_series.loc[ofi_series["step_idx"] == step, ofi_col]
+_cur_ofi = float(_cur_ofi_row.iloc[0]) if not _cur_ofi_row.empty else 0.0
+
+mcol1, mcol2, mcol3, mcol4, mcol5, mcol6 = st.columns(6)
 mcol1.metric("Mid Price", f"{ob['mid_price']:.2f}" if ob["mid_price"] else "—")
 
 if ob["bids"] and ob["asks"]:
@@ -395,218 +428,263 @@ if _cur_imb is not None:
 else:
     mcol5.metric("Imbalance", "—")
 
-# ---------------------------------------------------------------------------
-# Layout: Order book + Trades  |  Price chart
-# ---------------------------------------------------------------------------
-left_col, right_col = st.columns([2, 3])
+mcol6.metric(f"OFI ({ofi_window})", f"{_cur_ofi:+.0f}")
 
-# ---- LEFT: Order Book Ladder + Trades ----
-with left_col:
+# ---------------------------------------------------------------------------
+# Layout: Price chart (full width) then Order Book + Trades side-by-side
+# ---------------------------------------------------------------------------
+
+# ---- FULL WIDTH: Price Chart ----
+st.subheader("Price Context")
+
+if not price_ctx.empty:
+    # Compute imbalance for the visible window
+    price_ctx_imb = compute_imbalance(price_ctx)
+    imb_vals = price_ctx_imb[imbalance_col].values
+
+    ctx_steps = price_ctx_imb["step_idx"].values
+
+    # Slice pre-computed OFI to the visible window
+    ofi_mask = (ofi_series["step_idx"] >= ctx_steps[0]) & (ofi_series["step_idx"] <= ctx_steps[-1])
+    ofi_ctx = ofi_series.loc[ofi_mask]
+    ofi_steps = ofi_ctx["step_idx"].values
+    ofi_vals = ofi_ctx[ofi_col].values
+
+    # Compute extreme OFI thresholds (top/bottom 10% of the *full* series)
+    _full_ofi = ofi_series[ofi_col].values
+    _nonzero = _full_ofi[_full_ofi != 0]
+    if len(_nonzero) > 2:
+        ofi_p90 = float(np.percentile(_nonzero, 90))
+        ofi_p10 = float(np.percentile(_nonzero, 10))
+    else:
+        ofi_p90 = 1.0
+        ofi_p10 = -1.0
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.40, 0.15, 0.22, 0.23],
+        vertical_spacing=0.035,
+    )
+
+    n_ticks = min(12, len(ctx_steps))
+    tick_positions = np.linspace(0, len(ctx_steps) - 1, n_ticks, dtype=int)
+    tick_step_vals = [int(ctx_steps[i]) for i in tick_positions]
+    tick_labels_list = [idx["labels"].get(sv, str(sv)) for sv in tick_step_vals]
+
+    day_boundary_steps = [
+        b for b in idx["day_boundaries"]
+        if ctx_steps[0] <= b["step_idx"] <= ctx_steps[-1]
+    ]
+
+    # ----- Row 1: Price chart -----
+    fig.add_trace(
+        go.Scatter(
+            x=ctx_steps, y=price_ctx_imb["mid_price"].values,
+            mode="lines", name="Mid Price",
+            line=dict(color="#5C9DFF", width=2),
+            hovertemplate="%{y:.2f}<extra>Mid</extra>",
+        ),
+        row=1, col=1,
+    )
+
+    if "bid_price_1" in price_ctx_imb.columns and "ask_price_1" in price_ctx_imb.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=ctx_steps, y=price_ctx_imb["bid_price_1"].values,
+                mode="lines", name="Best Bid",
+                line=dict(color="rgba(38,166,91,0.5)", width=1),
+                hovertemplate="%{y:.2f}<extra>Bid</extra>",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=ctx_steps, y=price_ctx_imb["ask_price_1"].values,
+                mode="lines", name="Best Ask",
+                line=dict(color="rgba(239,83,80,0.5)", width=1),
+                fill="tonexty", fillcolor="rgba(200,200,200,0.08)",
+                hovertemplate="%{y:.2f}<extra>Ask</extra>",
+            ),
+            row=1, col=1,
+        )
+
+    if not trades_ctx.empty and "step_idx" in trades_ctx.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=trades_ctx["step_idx"].values,
+                y=trades_ctx["price"].values,
+                mode="markers", name="Trades",
+                marker=dict(
+                    color="#FFA726",
+                    size=trades_ctx["quantity"].clip(upper=20).values + 4,
+                    opacity=0.7, line=dict(width=1, color="#333"),
+                ),
+                hovertemplate="P=%{y:.1f}<br>Q=%{text}<extra>Trade</extra>",
+                text=trades_ctx["quantity"].values,
+            ),
+            row=1, col=1,
+        )
+
+    # Current position marker
+    fig.add_vline(x=step, line_dash="dash", line_color="rgba(255,255,255,0.6)", line_width=1.5)
+    if ob["mid_price"]:
+        fig.add_trace(
+            go.Scatter(
+                x=[step], y=[ob["mid_price"]],
+                mode="markers", name="Now",
+                marker=dict(color="white", size=10, symbol="diamond"),
+                showlegend=False, hoverinfo="skip",
+            ),
+            row=1, col=1,
+        )
+
+    # Extreme OBI zones on price panel
+    _in_zone = False
+    _zone_start = None
+    _zone_sign = 0
+    for k, (sx, iv) in enumerate(zip(ctx_steps, imb_vals)):
+        if abs(iv) >= imbalance_threshold:
+            if not _in_zone:
+                _in_zone = True
+                _zone_start = sx
+                _zone_sign = 1 if iv > 0 else -1
+        else:
+            if _in_zone:
+                _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
+                fig.add_vrect(
+                    x0=_zone_start, x1=ctx_steps[k - 1],
+                    fillcolor=_color, line_width=0,
+                    layer="below", row=1, col=1,
+                )
+                _in_zone = False
+    if _in_zone:
+        _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
+        fig.add_vrect(
+            x0=_zone_start, x1=ctx_steps[-1],
+            fillcolor=_color, line_width=0,
+            layer="below", row=1, col=1,
+        )
+
+    # Day boundaries (all rows)
+    for b in day_boundary_steps:
+        fig.add_vline(x=b["step_idx"], line_dash="dot",
+                      line_color="rgba(255,215,0,0.4)", line_width=1)
+        fig.add_annotation(
+            x=b["step_idx"], y=1.0, yref="y domain",
+            text=f"Day {b['day']}", showarrow=False,
+            font=dict(size=10, color="rgba(255,215,0,0.7)"),
+            yanchor="bottom", xanchor="left", xshift=4,
+        )
+
+    # ----- Row 2: OBI subplot -----
+    imb_colors = np.where(
+        imb_vals >= 0,
+        "rgba(34,197,94,0.7)",
+        "rgba(239,68,68,0.7)",
+    )
+    fig.add_trace(
+        go.Bar(
+            x=ctx_steps, y=imb_vals,
+            name="Imbalance",
+            marker_color=imb_colors.tolist(),
+            hovertemplate="%{y:+.3f}<extra>Imbalance</extra>",
+        ),
+        row=2, col=1,
+    )
+    fig.add_hline(y=imbalance_threshold, line_dash="dot",
+                  line_color="rgba(34,197,94,0.4)", line_width=1, row=2, col=1)
+    fig.add_hline(y=-imbalance_threshold, line_dash="dot",
+                  line_color="rgba(239,68,68,0.4)", line_width=1, row=2, col=1)
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_width=0.5, row=2, col=1)
+
+    # ----- Row 3: OFI subplot -----
+    ofi_bar_colors = np.where(
+        ofi_vals >= 0,
+        "rgba(100,181,246,0.7)",   # blue for net buy flow
+        "rgba(239,154,154,0.7)",   # light red for net sell flow
+    )
+    extreme_mask = (ofi_vals >= ofi_p90) | (ofi_vals <= ofi_p10)
+    ofi_bar_colors = np.where(
+        extreme_mask & (ofi_vals >= 0),
+        "rgba(33,150,243,1.0)",    # bright blue – extreme buy
+        np.where(
+            extreme_mask & (ofi_vals < 0),
+            "rgba(244,67,54,1.0)",     # bright red – extreme sell
+            ofi_bar_colors,
+        ),
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=ofi_steps, y=ofi_vals,
+            name=f"OFI ({ofi_window})",
+            marker_color=ofi_bar_colors.tolist(),
+            hovertemplate="%{y:+.0f}<extra>OFI</extra>",
+        ),
+        row=3, col=1,
+    )
+    fig.add_hline(y=ofi_p90, line_dash="dot",
+                  line_color="rgba(33,150,243,0.45)", line_width=1, row=3, col=1)
+    fig.add_hline(y=ofi_p10, line_dash="dot",
+                  line_color="rgba(244,67,54,0.45)", line_width=1, row=3, col=1)
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_width=0.5, row=3, col=1)
+
+    # ----- Row 4: Volume subplot -----
+    if "bid_volume_1" in price_ctx_imb.columns:
+        bid_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("bid_volume")]
+        ask_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("ask_volume")]
+        fig.add_trace(
+            go.Bar(x=ctx_steps, y=price_ctx_imb[bid_vol_cols].sum(axis=1).values,
+                   name="Bid Vol", marker_color="rgba(38,166,91,0.5)"),
+            row=4, col=1,
+        )
+        fig.add_trace(
+            go.Bar(x=ctx_steps, y=price_ctx_imb[ask_vol_cols].sum(axis=1).values,
+                   name="Ask Vol", marker_color="rgba(239,83,80,0.5)"),
+            row=4, col=1,
+        )
+
+    # ----- Layout -----
+    fig.update_layout(
+        height=820,
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        barmode="group", hovermode="x unified",
+    )
+    for r in (1, 2, 3):
+        fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
+                         showticklabels=False, row=r, col=1)
+    fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
+                     tickangle=-30, row=4, col=1)
+
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    _imb_axis_label = "Imb L1" if imbalance_col == "imbalance_l1" else "Imb L3"
+    fig.update_yaxes(title_text=_imb_axis_label, range=[-1.05, 1.05], row=2, col=1)
+    fig.update_yaxes(title_text=f"OFI({ofi_window})", row=3, col=1)
+    fig.update_yaxes(title_text="Book Vol", row=4, col=1)
+
+    st.plotly_chart(fig, use_container_width=True, key="price_chart")
+else:
+    st.info("No price context available.")
+
+# ---------------------------------------------------------------------------
+# Order Book + Trades (side by side, below chart)
+# ---------------------------------------------------------------------------
+ob_col, trades_col = st.columns(2)
+
+with ob_col:
     st.subheader("Order Book Depth")
     ob_html = build_ob_ladder_html(ob)
     ob_height = compute_ob_height(ob)
     components.html(ob_html, height=ob_height, scrolling=False)
 
-    st.markdown("---")
+with trades_col:
     trade_count = len(current_trades) if not current_trades.empty else 0
     st.subheader(f"Trades at Timestamp ({trade_count})")
     trades_html = build_trades_html(current_trades)
     trades_height = compute_trades_height(current_trades)
     components.html(trades_html, height=trades_height, scrolling=False)
-
-# ---- RIGHT: Price Chart ----
-with right_col:
-    st.subheader("Price Context")
-
-    if not price_ctx.empty:
-        # Compute imbalance for the visible window
-        price_ctx_imb = compute_imbalance(price_ctx)
-        imb_vals = price_ctx_imb[imbalance_col].values
-
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.55, 0.20, 0.25],
-            vertical_spacing=0.04,
-            subplot_titles=(None, None, None),
-        )
-
-        ctx_steps = price_ctx_imb["step_idx"].values
-
-        n_ticks = min(12, len(ctx_steps))
-        tick_positions = np.linspace(0, len(ctx_steps) - 1, n_ticks, dtype=int)
-        tick_step_vals = [int(ctx_steps[i]) for i in tick_positions]
-        tick_labels_list = [idx["labels"].get(sv, str(sv)) for sv in tick_step_vals]
-
-        day_boundary_steps = [
-            b for b in idx["day_boundaries"]
-            if ctx_steps[0] <= b["step_idx"] <= ctx_steps[-1]
-        ]
-
-        # ----- Row 1: Price chart -----
-        # Mid price
-        fig.add_trace(
-            go.Scatter(
-                x=ctx_steps, y=price_ctx_imb["mid_price"].values,
-                mode="lines", name="Mid Price",
-                line=dict(color="#5C9DFF", width=2),
-                hovertemplate="%{y:.2f}<extra>Mid</extra>",
-            ),
-            row=1, col=1,
-        )
-
-        # Bid/Ask bands
-        if "bid_price_1" in price_ctx_imb.columns and "ask_price_1" in price_ctx_imb.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=ctx_steps, y=price_ctx_imb["bid_price_1"].values,
-                    mode="lines", name="Best Bid",
-                    line=dict(color="rgba(38,166,91,0.5)", width=1),
-                    hovertemplate="%{y:.2f}<extra>Bid</extra>",
-                ),
-                row=1, col=1,
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=ctx_steps, y=price_ctx_imb["ask_price_1"].values,
-                    mode="lines", name="Best Ask",
-                    line=dict(color="rgba(239,83,80,0.5)", width=1),
-                    fill="tonexty", fillcolor="rgba(200,200,200,0.08)",
-                    hovertemplate="%{y:.2f}<extra>Ask</extra>",
-                ),
-                row=1, col=1,
-            )
-
-        # Trade markers
-        if not trades_ctx.empty and "step_idx" in trades_ctx.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=trades_ctx["step_idx"].values,
-                    y=trades_ctx["price"].values,
-                    mode="markers", name="Trades",
-                    marker=dict(
-                        color="#FFA726",
-                        size=trades_ctx["quantity"].clip(upper=20).values + 4,
-                        opacity=0.7, line=dict(width=1, color="#333"),
-                    ),
-                    hovertemplate="P=%{y:.1f}<br>Q=%{text}<extra>Trade</extra>",
-                    text=trades_ctx["quantity"].values,
-                ),
-                row=1, col=1,
-            )
-
-        # Current position
-        fig.add_vline(x=step, line_dash="dash", line_color="rgba(255,255,255,0.6)", line_width=1.5)
-        if ob["mid_price"]:
-            fig.add_trace(
-                go.Scatter(
-                    x=[step], y=[ob["mid_price"]],
-                    mode="markers", name="Now",
-                    marker=dict(color="white", size=10, symbol="diamond"),
-                    showlegend=False, hoverinfo="skip",
-                ),
-                row=1, col=1,
-            )
-
-        # Extreme imbalance zones — highlight on the price subplot
-        # Walk through imbalance values and find contiguous runs above the threshold
-        _in_zone = False
-        _zone_start = None
-        _zone_sign = 0
-        for k, (sx, iv) in enumerate(zip(ctx_steps, imb_vals)):
-            if abs(iv) >= imbalance_threshold:
-                if not _in_zone:
-                    _in_zone = True
-                    _zone_start = sx
-                    _zone_sign = 1 if iv > 0 else -1
-            else:
-                if _in_zone:
-                    _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
-                    fig.add_vrect(
-                        x0=_zone_start, x1=ctx_steps[k - 1],
-                        fillcolor=_color, line_width=0,
-                        layer="below", row=1, col=1,
-                    )
-                    _in_zone = False
-        # Close trailing zone
-        if _in_zone:
-            _color = "rgba(34,197,94,0.12)" if _zone_sign > 0 else "rgba(239,68,68,0.12)"
-            fig.add_vrect(
-                x0=_zone_start, x1=ctx_steps[-1],
-                fillcolor=_color, line_width=0,
-                layer="below", row=1, col=1,
-            )
-
-        # Day boundaries (all rows)
-        for b in day_boundary_steps:
-            fig.add_vline(x=b["step_idx"], line_dash="dot",
-                          line_color="rgba(255,215,0,0.4)", line_width=1)
-            fig.add_annotation(
-                x=b["step_idx"], y=1.0, yref="y domain",
-                text=f"Day {b['day']}", showarrow=False,
-                font=dict(size=10, color="rgba(255,215,0,0.7)"),
-                yanchor="bottom", xanchor="left", xshift=4,
-            )
-
-        # ----- Row 2: Imbalance subplot -----
-        # Color each bar green (bid pressure) or red (ask pressure)
-        imb_colors = np.where(
-            imb_vals >= 0,
-            "rgba(34,197,94,0.7)",   # green for bid-heavy
-            "rgba(239,68,68,0.7)",   # red for ask-heavy
-        )
-        fig.add_trace(
-            go.Bar(
-                x=ctx_steps, y=imb_vals,
-                name="Imbalance",
-                marker_color=imb_colors.tolist(),
-                hovertemplate="%{y:+.3f}<extra>Imbalance</extra>",
-            ),
-            row=2, col=1,
-        )
-        # Threshold reference lines
-        fig.add_hline(y=imbalance_threshold, line_dash="dot",
-                      line_color="rgba(34,197,94,0.4)", line_width=1, row=2, col=1)
-        fig.add_hline(y=-imbalance_threshold, line_dash="dot",
-                      line_color="rgba(239,68,68,0.4)", line_width=1, row=2, col=1)
-        fig.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_width=0.5, row=2, col=1)
-
-        # ----- Row 3: Volume subplot -----
-        if "bid_volume_1" in price_ctx_imb.columns:
-            bid_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("bid_volume")]
-            ask_vol_cols = [c for c in price_ctx_imb.columns if c.startswith("ask_volume")]
-            fig.add_trace(
-                go.Bar(x=ctx_steps, y=price_ctx_imb[bid_vol_cols].sum(axis=1).values,
-                       name="Bid Vol", marker_color="rgba(38,166,91,0.5)"),
-                row=3, col=1,
-            )
-            fig.add_trace(
-                go.Bar(x=ctx_steps, y=price_ctx_imb[ask_vol_cols].sum(axis=1).values,
-                       name="Ask Vol", marker_color="rgba(239,83,80,0.5)"),
-                row=3, col=1,
-            )
-
-        fig.update_layout(
-            height=700,
-            margin=dict(l=0, r=0, t=10, b=0),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-            barmode="group", hovermode="x unified",
-        )
-        # X-axis tick labels only on the bottom subplot
-        fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
-                         tickangle=-30, row=3, col=1)
-        fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
-                         showticklabels=False, row=1, col=1)
-        fig.update_xaxes(tickvals=tick_step_vals, ticktext=tick_labels_list,
-                         showticklabels=False, row=2, col=1)
-        fig.update_yaxes(title_text="Price", row=1, col=1)
-        _imb_axis_label = "Imb L1" if imbalance_col == "imbalance_l1" else "Imb L3"
-        fig.update_yaxes(title_text=_imb_axis_label, range=[-1.05, 1.05], row=2, col=1)
-        fig.update_yaxes(title_text="Book Vol", row=3, col=1)
-
-        st.plotly_chart(fig, use_container_width=True, key="price_chart")
-    else:
-        st.info("No price context available.")
 
 # ---------------------------------------------------------------------------
 # Jump-to-timestamp

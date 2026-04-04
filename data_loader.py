@@ -307,6 +307,152 @@ def compute_imbalance(price_ctx: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_ofi_series(
+    trades: pd.DataFrame,
+    prices: pd.DataFrame,
+    instrument: str,
+    idx: dict,
+    windows: tuple = (5, 10, 20),
+) -> pd.DataFrame:
+    """Compute Order Flow Imbalance series using quote-rule classification.
+
+    For each trade, the quote rule classifies it as a buy (price >= mid) or
+    sell (price < mid).  Signed quantity is aggregated per step, then rolling
+    sums over *windows* give the OFI columns (ofi_5, ofi_10, ofi_20).
+
+    Returns DataFrame with columns: step_idx, net_flow, ofi_5, ofi_10, ofi_20.
+    """
+    inst_trades = trades[trades["instrument"] == instrument].copy()
+    if inst_trades.empty:
+        cols = ["step_idx", "net_flow"] + [f"ofi_{w}" for w in windows]
+        return pd.DataFrame(columns=cols)
+
+    inst_trades["step_idx"] = inst_trades["ts_key"].map(idx["ts_to_step"])
+    inst_trades = inst_trades.dropna(subset=["step_idx"])
+    inst_trades["step_idx"] = inst_trades["step_idx"].astype(int)
+
+    # Get mid prices for quote rule
+    inst_prices = idx["inst_prices"]
+    mid_map = dict(zip(inst_prices["step_idx"].values, inst_prices["mid_price"].values))
+    inst_trades["mid_price"] = inst_trades["step_idx"].map(mid_map)
+    inst_trades = inst_trades.dropna(subset=["mid_price", "price", "quantity"])
+
+    # Quote-rule: trade at or above mid → buy (+qty), below → sell (-qty)
+    inst_trades["signed_qty"] = np.where(
+        inst_trades["price"] >= inst_trades["mid_price"],
+        inst_trades["quantity"],
+        -inst_trades["quantity"],
+    )
+
+    # Aggregate per step
+    flow = inst_trades.groupby("step_idx")["signed_qty"].sum().reset_index()
+    flow.columns = ["step_idx", "net_flow"]
+
+    # Full step range (fill missing steps with 0)
+    all_steps = pd.DataFrame({"step_idx": idx["step_idxs"]})
+    flow = all_steps.merge(flow, on="step_idx", how="left")
+    flow["net_flow"] = flow["net_flow"].fillna(0)
+    flow = flow.sort_values("step_idx").reset_index(drop=True)
+
+    # Rolling OFI via cumsum trick
+    cs = flow["net_flow"].cumsum().values
+    for w in windows:
+        rolled = np.empty(len(cs))
+        rolled[:w] = cs[:w]
+        rolled[w:] = cs[w:] - cs[:-w]
+        flow[f"ofi_{w}"] = rolled
+
+    return flow
+
+
+def run_event_study(
+    inst_prices: pd.DataFrame,
+    ofi_df: pd.DataFrame,
+    event_type: str,
+    threshold: float,
+    ofi_col: str,
+    imbalance_col: str,
+    horizon: int,
+) -> dict:
+    """Detect events and compute average post-event return path.
+
+    Args:
+        inst_prices: Full instrument DataFrame with step_idx, mid_price, etc.
+        ofi_df: OFI series from build_ofi_series().
+        event_type: "OFI Spike", "Imbalance Spike", or "OFI + Imbalance".
+        threshold: 0-10 scale.  OFI uses z-score (threshold × σ from mean),
+                   imbalance uses threshold / 10 as a direct cutoff.
+        ofi_col: OFI column name (e.g. "ofi_5").
+        imbalance_col: Imbalance column name (e.g. "imbalance_l1").
+        horizon: Number of forward steps to track.
+
+    Returns dict with:
+        avg_path    – list[float] of length horizon+1, average return in bps.
+        event_count – number of detected events.
+        event_steps – list of step_idx values where events were detected.
+    """
+    df = compute_imbalance(inst_prices)[["step_idx", "mid_price", imbalance_col]].copy()
+    df = df.merge(ofi_df[["step_idx", ofi_col]], on="step_idx", how="left")
+    df[ofi_col] = df[ofi_col].fillna(0)
+    df = df.sort_values("step_idx").reset_index(drop=True)
+
+    mid_prices = df["mid_price"].values
+    ofi_vals = df[ofi_col].values
+    imb_vals = df[imbalance_col].values
+
+    # OFI threshold via z-score; imbalance threshold via direct mapping
+    ofi_std = np.nanstd(ofi_vals)
+    ofi_mean = np.nanmean(ofi_vals)
+    ofi_cutoff = abs(ofi_mean) + threshold * ofi_std if ofi_std > 0 else float("inf")
+    imb_cutoff = threshold / 10.0
+
+    if event_type == "OFI Spike":
+        event_mask = np.abs(ofi_vals) > ofi_cutoff
+    elif event_type == "Imbalance Spike":
+        event_mask = np.abs(imb_vals) > imb_cutoff
+    else:  # OFI + Imbalance
+        event_mask = (np.abs(ofi_vals) > ofi_cutoff) & (np.abs(imb_vals) > imb_cutoff)
+
+    # Exclude events too close to end (need full horizon ahead)
+    max_start = len(df) - horizon
+    if max_start > 0:
+        event_mask[max_start:] = False
+
+    event_indices = np.where(event_mask)[0]
+
+    if len(event_indices) == 0:
+        return {"avg_path": [], "event_count": 0, "event_steps": []}
+
+    # Forward returns in basis points (bps)
+    paths = []
+    valid_steps = []
+    step_idxs = df["step_idx"].values
+    for ei in event_indices:
+        base = mid_prices[ei]
+        if np.isnan(base) or base == 0:
+            continue
+        path = []
+        for h in range(horizon + 1):
+            fp = mid_prices[ei + h]
+            if np.isnan(fp):
+                path.append(np.nan)
+            else:
+                path.append((fp / base - 1) * 10000)
+        paths.append(path)
+        valid_steps.append(int(step_idxs[ei]))
+
+    if not paths:
+        return {"avg_path": [], "event_count": 0, "event_steps": []}
+
+    avg_path = np.nanmean(np.array(paths), axis=0).tolist()
+
+    return {
+        "avg_path": avg_path,
+        "event_count": len(paths),
+        "event_steps": valid_steps,
+    }
+
+
 def format_step_label(day, timestamp) -> str:
     """Format a single step as a readable label."""
     if day is not None and timestamp is not None:

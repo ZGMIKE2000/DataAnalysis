@@ -23,6 +23,7 @@ from data_loader import (
     format_step_label,
     compute_imbalance,
     build_ofi_series,
+    run_event_study,
 )
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,13 @@ if idx is None:
     st.stop()
 
 total_steps = len(idx["step_idxs"])
+
+# Pre-compute OFI series (cached)
+@st.cache_data(show_spinner=False)
+def cached_ofi(_trades, _prices, instrument, _idx, _folder_path):
+    return build_ofi_series(_trades, _prices, instrument, _idx)
+
+ofi_series = cached_ofi(trades, prices, selected_instrument, idx, selected_dir["path"])
 
 # Context window slider — max = total_steps so user can view the full series
 context_window = st.sidebar.slider(
@@ -685,6 +693,83 @@ with trades_col:
     trades_html = build_trades_html(current_trades)
     trades_height = compute_trades_height(current_trades)
     components.html(trades_html, height=trades_height, scrolling=False)
+
+# ---------------------------------------------------------------------------
+# Event Study
+# ---------------------------------------------------------------------------
+with st.expander("Event Study", expanded=False):
+    ev_cols = st.columns([1, 1, 1, 1, 1])
+    with ev_cols[0]:
+        ev_type = st.selectbox(
+            "Signal type",
+            ["OFI Spike", "Imbalance Spike", "OFI + Imbalance"],
+            key="ev_type",
+        )
+    with ev_cols[1]:
+        ev_threshold = st.slider(
+            "Threshold",
+            min_value=0.5,
+            max_value=10.0,
+            value=2.0,
+            step=0.5,
+            key="ev_threshold",
+            help="OFI: number of σ from mean.  Imbalance: value / 10 (e.g. 6 → |imb| > 0.6).",
+        )
+    with ev_cols[2]:
+        ev_ofi_window = st.selectbox(
+            "OFI window",
+            [5, 10, 20],
+            index=1,
+            key="ev_ofi_window",
+        )
+    with ev_cols[3]:
+        ev_horizon = st.selectbox(
+            "Horizon (steps)",
+            [10, 20, 50, 100],
+            index=1,
+            key="ev_horizon",
+        )
+    with ev_cols[4]:
+        st.markdown("<br>", unsafe_allow_html=True)
+        run_study = st.button("Run Event Study", key="run_ev_study", use_container_width=True)
+
+    if run_study:
+        ev_ofi_col = f"ofi_{ev_ofi_window}"
+        result = run_event_study(
+            inst_prices=idx["inst_prices"],
+            ofi_df=ofi_series,
+            event_type=ev_type,
+            threshold=ev_threshold,
+            ofi_col=ev_ofi_col,
+            imbalance_col=imbalance_col,
+            horizon=ev_horizon,
+        )
+        st.session_state["ev_result"] = result
+
+    ev_result = st.session_state.get("ev_result")
+    if ev_result and ev_result["event_count"] > 0:
+        st.caption(f"**{ev_result['event_count']} events detected** — average post-event return path (bps)")
+        ev_fig = go.Figure()
+        ev_fig.add_trace(go.Scatter(
+            x=list(range(len(ev_result["avg_path"]))),
+            y=ev_result["avg_path"],
+            mode="lines+markers",
+            name="Avg Return",
+            line=dict(color="#5C9DFF", width=2),
+            marker=dict(size=4),
+            hovertemplate="t+%{x}: %{y:+.2f} bps<extra></extra>",
+        ))
+        ev_fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
+        ev_fig.update_layout(
+            height=300,
+            margin=dict(l=0, r=0, t=10, b=0),
+            xaxis_title="Steps after event",
+            yaxis_title="Return (bps)",
+            hovermode="x unified",
+        )
+        st.plotly_chart(ev_fig, use_container_width=True, key="ev_chart")
+    elif ev_result is not None and ev_result["event_count"] == 0:
+        st.info("No events detected with current settings. Try lowering the threshold.")
 
 # ---------------------------------------------------------------------------
 # Jump-to-timestamp

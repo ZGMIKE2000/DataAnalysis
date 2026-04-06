@@ -27,13 +27,22 @@ def discover_data_dirs(root: str) -> list[dict]:
             continue
         round_num = int(m.group(1))
 
-        path_str = str(folder)
-        if "Prosperity 4" in path_str or "prosperity4" in path_str:
+        # Detect season from the closest path component, not the full path
+        # (avoids false matches when the repo itself sits inside "Prosperity 4/")
+        parts = [p.lower() for p in folder.parts]
+        if "prosperity4" in parts:
             season = 4
-        elif "Prosperity 3" in path_str or "prosperity3" in path_str:
+        elif "prosperity3" in parts:
             season = 3
         else:
-            season = 0
+            # Fallback: check folder name fragments
+            folder_lower = folder.name.lower()
+            if "prosperity4" in folder_lower or "prosperity 4" in folder_lower:
+                season = 4
+            elif "prosperity3" in folder_lower or "prosperity 3" in folder_lower:
+                season = 3
+            else:
+                season = 0
 
         label = f"S{season} Round {round_num} — {folder.name}"
         results.append({
@@ -312,57 +321,82 @@ def build_ofi_series(
     prices: pd.DataFrame,
     instrument: str,
     idx: dict,
-    windows: tuple = (5, 10, 20),
+    windows: tuple[int, ...] = (5, 10, 20),
 ) -> pd.DataFrame:
-    """Compute Order Flow Imbalance series using quote-rule classification.
+    """Build Order Flow Imbalance series aligned to step_idx.
 
-    For each trade, the quote rule classifies it as a buy (price >= mid) or
-    sell (price < mid).  Signed quantity is aggregated per step, then rolling
-    sums over *windows* give the OFI columns (ofi_5, ofi_10, ofi_20).
+    Trade classification uses the **quote rule** (Lee-Ready simplified):
+    trade_price >= mid_price at the same ts_key → buy (+qty),
+    trade_price <  mid_price                    → sell (−qty).
 
-    Returns DataFrame with columns: step_idx, net_flow, ofi_5, ofi_10, ofi_20.
+    Returns a DataFrame with one row per step_idx containing:
+        net_flow      : signed trade volume at that step (0 if no trades)
+        ofi_{w}       : rolling sum of net_flow over *w* steps (one col per window)
+
+    The rolling sums use min_periods=1 so partial windows at the start are
+    still populated (avoids NaN cliffs on the chart).
+
+    Performance: fully vectorised — no per-row Python loops.
     """
-    inst_trades = trades[trades["instrument"] == instrument].copy()
-    if inst_trades.empty:
-        cols = ["step_idx", "net_flow"] + [f"ofi_{w}" for w in windows]
-        return pd.DataFrame(columns=cols)
+    step_idxs = idx["step_idxs"]
+    total_steps = len(step_idxs)
 
-    inst_trades["step_idx"] = inst_trades["ts_key"].map(idx["ts_to_step"])
+    # Fast path: no trades at all
+    if trades.empty or total_steps == 0:
+        out = pd.DataFrame({"step_idx": step_idxs, "net_flow": np.zeros(total_steps)})
+        for w in windows:
+            out[f"ofi_{w}"] = 0.0
+        return out
+
+    # 1. Filter trades for this instrument
+    inst_trades = trades.loc[trades["instrument"] == instrument].copy()
+    if inst_trades.empty:
+        out = pd.DataFrame({"step_idx": step_idxs, "net_flow": np.zeros(total_steps)})
+        for w in windows:
+            out[f"ofi_{w}"] = 0.0
+        return out
+
+    # 2. Map ts_key → step_idx for trades
+    ts_to_step = idx["ts_to_step"]
+    inst_trades["step_idx"] = inst_trades["ts_key"].map(ts_to_step)
     inst_trades = inst_trades.dropna(subset=["step_idx"])
     inst_trades["step_idx"] = inst_trades["step_idx"].astype(int)
 
-    # Get mid prices for quote rule
+    # 3. Get mid_price at each step from the pre-filtered prices
     inst_prices = idx["inst_prices"]
-    mid_map = dict(zip(inst_prices["step_idx"].values, inst_prices["mid_price"].values))
-    inst_trades["mid_price"] = inst_trades["step_idx"].map(mid_map)
-    inst_trades = inst_trades.dropna(subset=["mid_price", "price", "quantity"])
+    mid_lookup = inst_prices.set_index("ts_key")["mid_price"]
+    inst_trades["mid_price"] = inst_trades["ts_key"].map(mid_lookup)
 
-    # Quote-rule: trade at or above mid → buy (+qty), below → sell (-qty)
-    inst_trades["signed_qty"] = np.where(
-        inst_trades["price"] >= inst_trades["mid_price"],
-        inst_trades["quantity"],
-        -inst_trades["quantity"],
-    )
+    # 4. Quote-rule classification (vectorised)
+    price = inst_trades["price"].values
+    mid = inst_trades["mid_price"].values
+    qty = inst_trades["quantity"].values.astype(float)
 
-    # Aggregate per step
-    flow = inst_trades.groupby("step_idx")["signed_qty"].sum().reset_index()
-    flow.columns = ["step_idx", "net_flow"]
+    # buy when price >= mid, sell otherwise; NaN mid → treat as buy (conservative)
+    is_buy = np.where(np.isnan(mid), True, price >= mid)
+    signed = np.where(is_buy, qty, -qty)
+    inst_trades["signed_qty"] = signed
 
-    # Full step range (fill missing steps with 0)
-    all_steps = pd.DataFrame({"step_idx": idx["step_idxs"]})
-    flow = all_steps.merge(flow, on="step_idx", how="left")
-    flow["net_flow"] = flow["net_flow"].fillna(0)
-    flow = flow.sort_values("step_idx").reset_index(drop=True)
+    # 5. Aggregate per step_idx
+    net_by_step = inst_trades.groupby("step_idx")["signed_qty"].sum()
 
-    # Rolling OFI via cumsum trick
-    cs = flow["net_flow"].cumsum().values
+    # 6. Build full series aligned to every step_idx (fill 0 for no-trade steps)
+    net_flow = np.zeros(total_steps)
+    for si, val in net_by_step.items():
+        if 0 <= si < total_steps:
+            net_flow[si] = val
+
+    # 7. Rolling OFI via cumsum trick (O(n), no pandas overhead)
+    out = pd.DataFrame({"step_idx": step_idxs, "net_flow": net_flow})
+    cs = np.concatenate([[0.0], np.cumsum(net_flow)])
     for w in windows:
-        rolled = np.empty(len(cs))
-        rolled[:w] = cs[:w]
-        rolled[w:] = cs[w:] - cs[:-w]
-        flow[f"ofi_{w}"] = rolled
+        rolled = np.empty(total_steps)
+        for i in range(total_steps):
+            lo = max(0, i + 1 - w)
+            rolled[i] = cs[i + 1] - cs[lo]
+        out[f"ofi_{w}"] = rolled
 
-    return flow
+    return out
 
 
 def run_event_study(
@@ -380,16 +414,16 @@ def run_event_study(
         inst_prices: Full instrument DataFrame with step_idx, mid_price, etc.
         ofi_df: OFI series from build_ofi_series().
         event_type: "OFI Spike", "Imbalance Spike", or "OFI + Imbalance".
-        threshold: 0-10 scale.  OFI uses z-score (threshold × σ from mean),
+        threshold: 0-10 scale.  OFI uses z-score (threshold * std from mean),
                    imbalance uses threshold / 10 as a direct cutoff.
         ofi_col: OFI column name (e.g. "ofi_5").
         imbalance_col: Imbalance column name (e.g. "imbalance_l1").
         horizon: Number of forward steps to track.
 
     Returns dict with:
-        avg_path    – list[float] of length horizon+1, average return in bps.
-        event_count – number of detected events.
-        event_steps – list of step_idx values where events were detected.
+        avg_path    - list[float] of length horizon+1, average return in bps.
+        event_count - number of detected events.
+        event_steps - list of step_idx values where events were detected.
     """
     df = compute_imbalance(inst_prices)[["step_idx", "mid_price", imbalance_col]].copy()
     df = df.merge(ofi_df[["step_idx", ofi_col]], on="step_idx", how="left")
